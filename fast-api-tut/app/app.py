@@ -1,72 +1,92 @@
-from fastapi import FastAPI, HTTPException
-from app.schemas import PostCreate, PostResponse
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
 from app.db import Post, create_db_and_tables, get_async_session
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imagekit
+import shutil
+import os
+import tempfile
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_db_and_tables()
     yield
+
 app = FastAPI(lifespan=lifespan)
 
-text_posts = {
-    1: {
-        "title": "Morning Run Thoughts",
-        "content": "Went for a 5km run this morning and realized how consistent small habits can really change your mindset. Feeling energized for the day!",
-    },
-    2: {
-        "title": "New Python Trick I Learned",
-        "content": "Just discovered list comprehensions with conditional logic — makes my code so much cleaner. Why didn’t I use this earlier?",
-    },
-    3: {
-        "title": "Coffee Shop Review",
-        "content": "Tried a new coffee shop downtown today. Great ambience, decent espresso, but a bit overpriced. Still worth checking out once.",
-    },
-    4: {
-        "title": "Weekend Getaway",
-        "content": "Spent the weekend at the beach. No emails, no Slack, just waves and fresh air. Highly recommend unplugging once in a while.",
-    },
-    5: {
-        "title": "Debugging Frustration",
-        "content": "Spent 2 hours fixing a bug... turns out it was a missing comma. Classic developer moment.",
-    },
-    6: {
-        "title": "Book Recommendation",
-        "content": "Currently reading 'Atomic Habits' — super insightful on how tiny changes compound into real progress over time.",
-    },
-    7: {
-        "title": "Gym Progress",
-        "content": "Finally hit a new personal record on deadlifts today 💪 Hard work paying off!",
-    },
-    8: {
-        "title": "Learning New Tech",
-        "content": "Started exploring Docker today. Containerization seemed intimidating at first, but it's actually pretty neat.",
-    },
-    9: {
-        "title": "Late Night Coding",
-        "content": "There’s something oddly satisfying about coding at 2AM with music in the background. Productivity hits different.",
-    },
-    10: {
-        "title": "Small Win Today",
-        "content": "Managed to finish all my tasks before 5PM. Rare but satisfying feeling 😄",
-    }
-}
+# Upload image to imagekit endpoint
+@app.post("/upload")
+async def upload_file(
+        file: UploadFile = File(...),
+        caption: str = Form(""),
+        session: AsyncSession = Depends(get_async_session),
+):
+    temp_file_path = None
 
-@app.get("/posts")
-def get_all_posts(limit: int = None):
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+    try:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=os.path.splitext(file.filename)[1]
+        ) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
 
-@app.get("/posts/{post_id}")
-def get_post(post_id: int) -> PostResponse:
-    if post_id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return text_posts.get(post_id)
+        # Read file as bytes
+        with open(temp_file_path, "rb") as f:
+            file_bytes = f.read()
 
-@app.post("/posts")
-def create_post(post: PostCreate) -> PostResponse:
-    new_post = {"title": post.title, "content": post.content}
-    text_posts[max(text_posts.keys()) + 1] = new_post
-    return new_post
+        # Upload to ImageKit
+        upload_result = imagekit.files.upload(
+            file=file_bytes,
+            file_name=file.filename,
+            use_unique_file_name=True,
+            tags=["backend-upload"],
+        )
+
+        post = Post(
+            caption=caption,
+            url=upload_result.url,
+            file_type=(
+                "video"
+                if file.content_type.startswith("video/")
+                else "image"
+            ),
+            file_name=upload_result.name,
+        )
+        session.add(post)
+        await session.commit()
+        await session.refresh(post)
+
+        return post
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+
+        file.file.close()
+
+@app.get("/feed")
+async def get_feed(
+        session: AsyncSession = Depends(get_async_session),
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
+
+    posts_data = []
+    for post in posts:
+        posts_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_name": post.file_name,
+                "created_at": post.created_at,
+                "updated_at": post.updated_at,
+            }
+        )
+
+    return {"posts": posts_data}
